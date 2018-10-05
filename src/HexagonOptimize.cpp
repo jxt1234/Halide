@@ -11,6 +11,7 @@
 #include "Scope.h"
 #include "Simplify.h"
 #include "Substitute.h"
+#include "HexagonAlignment.h"
 #include <unordered_map>
 
 namespace Halide {
@@ -676,6 +677,16 @@ private:
             { "halide.hexagon.add_shl.vw.vw.w", wild_u32x + (wild_u32x*bc(wild_u32)), Pattern::ExactLog2Op2 },
             { "halide.hexagon.add_shl.vw.vw.w", wild_i32x + (bc(wild_i32)*wild_i32x), Pattern::ExactLog2Op1 | Pattern::SwapOps12 },
             { "halide.hexagon.add_shl.vw.vw.w", wild_u32x + (bc(wild_u32)*wild_u32x), Pattern::ExactLog2Op1 | Pattern::SwapOps12 },
+            { "halide.hexagon.add_shl.vh.vh.h", wild_i16x + (wild_i16x << bc(wild_i16)), Pattern::v65orLater },
+            { "halide.hexagon.add_shl.vh.vh.h", wild_u16x + (wild_u16x << bc(wild_u16)), Pattern::v65orLater },
+            { "halide.hexagon.add_shl.vh.vh.h", wild_i16x + (bc(wild_i16) << wild_i16x), Pattern::SwapOps12 | Pattern::v65orLater },
+            { "halide.hexagon.add_shl.vh.vh.h", wild_u16x + (bc(wild_u16) << wild_u16x), Pattern::SwapOps12 | Pattern::v65orLater },
+            { "halide.hexagon.add_shr.vh.vh.h", wild_i16x + (wild_i16x >> bc(wild_i16)), Pattern::v65orLater },
+            { "halide.hexagon.add_shr.vh.vh.h", wild_i16x + (wild_i16x/bc(wild_i16)), Pattern::ExactLog2Op2 | Pattern::v65orLater },
+            { "halide.hexagon.add_shl.vh.vh.h", wild_i16x + (wild_i16x*bc(wild_i16)), Pattern::ExactLog2Op2 | Pattern::v65orLater },
+            { "halide.hexagon.add_shl.vh.vh.h", wild_u16x + (wild_u16x*bc(wild_u16)), Pattern::ExactLog2Op2 | Pattern::v65orLater },
+            { "halide.hexagon.add_shl.vh.vh.h", wild_i16x + (bc(wild_i16)*wild_i16x), Pattern::ExactLog2Op1 | Pattern::SwapOps12 | Pattern::v65orLater },
+            { "halide.hexagon.add_shl.vh.vh.h", wild_u16x + (bc(wild_u16)*wild_u16x), Pattern::ExactLog2Op1 | Pattern::SwapOps12 | Pattern::v65orLater },
 
             // Non-widening multiply-accumulates with a scalar.
             { "halide.hexagon.add_mul.vh.vh.b", wild_i16x + wild_i16x*bc(wild_i16), Pattern::NarrowOp2 },
@@ -770,6 +781,8 @@ private:
             { "halide.hexagon.avg.vuh.vuh", u16((wild_u32x + wild_u32x)/2), Pattern::NarrowOps },
             { "halide.hexagon.avg.vh.vh", i16((wild_i32x + wild_i32x)/2), Pattern::NarrowOps },
             { "halide.hexagon.avg.vw.vw", i32((wild_i64x + wild_i64x)/2), Pattern::NarrowOps },
+            { "halide.hexagon.avg.vb.vb", i8((wild_i16x + wild_i16x)/2), Pattern::NarrowOps | Pattern::v65orLater },
+            { "halide.hexagon.avg.vuw.vuw", u32((wild_u64x + wild_u64x)/2), Pattern::NarrowOps | Pattern::v65orLater },
 
             { "halide.hexagon.avg_rnd.vub.vub", u8((wild_u16x + wild_u16x + 1)/2), Pattern::NarrowOps },
             { "halide.hexagon.avg_rnd.vuh.vuh", u16((wild_u32x + wild_u32x + 1)/2), Pattern::NarrowOps },
@@ -1013,8 +1026,12 @@ public:
 class EliminateInterleaves : public IRMutator2 {
     Scope<bool> vars;
 
+
     // We need to know when loads are a multiple of 2 native vectors.
     int native_vector_bits;
+
+    // Alignment analyzer for loads and stores
+    HexagonAlignmentAnalyzer alignment_analyzer;
 
     // We can't interleave booleans, so we handle them specially.
     bool in_bool_to_mask = false;
@@ -1197,6 +1214,11 @@ class EliminateInterleaves : public IRMutator2 {
 
     template <typename NodeType, typename LetType>
     NodeType visit_let(const LetType *op) {
+        // Push alignment info on the stack
+        if (op->value.type() == Int(32)) {
+            alignment_analyzer.push(op->name, op->value);
+        }
+
         Expr value = mutate(op->value);
         string deinterleaved_name;
         NodeType body;
@@ -1222,6 +1244,12 @@ class EliminateInterleaves : public IRMutator2 {
         } else {
             body = mutate(op->body);
         }
+
+        // Pop alignment info from the scope stack
+        if (op->value.type() == Int(32)) {
+            alignment_analyzer.pop(op->name);
+        }
+
         if (value.same_as(op->value) && body.same_as(op->body)) {
             return op;
         } else if (body.same_as(op->body)) {
@@ -1443,6 +1471,9 @@ class EliminateInterleaves : public IRMutator2 {
     };
     Scope<BufferState> buffers;
 
+    // False for buffers that have any loads or stores that are unaligned
+    Scope<bool> aligned_buffer_access;
+
     // Buffers we should deinterleave the storage of.
     Scope<bool> deinterleave_buffers;
 
@@ -1452,8 +1483,13 @@ class EliminateInterleaves : public IRMutator2 {
         // First, we need to mutate the op, to pull native interleaves
         // down, and to gather information about the loads and stores.
         buffers.push(op->name, BufferState::Unknown);
+
+        // Assume buffers are accessed by aligned loads and stores by default.
+        aligned_buffer_access.push(op->name, true);
+
         Stmt body = mutate(op->body);
-        bool deinterleave = buffers.get(op->name) == BufferState::Interleaved;
+        bool deinterleave = (buffers.get(op->name) == BufferState::Interleaved) &&
+            (aligned_buffer_access.get(op->name) == true);
         buffers.pop(op->name);
 
         // Second, if we decided it would be useful to deinterleave
@@ -1463,6 +1499,8 @@ class EliminateInterleaves : public IRMutator2 {
             body = mutate(op->body);
             deinterleave_buffers.pop(op->name);
         }
+
+        aligned_buffer_access.pop(op->name);
 
         if (!body.same_as(op->body) || !condition.same_as(op->condition)) {
             return Allocate::make(op->name, op->type, op->memory_type,
@@ -1481,7 +1519,7 @@ class EliminateInterleaves : public IRMutator2 {
         if (buffers.contains(op->name)) {
             // When inspecting the stores to a buffer, update the state.
             BufferState &state = buffers.ref(op->name);
-            if (!is_one(predicate)) {
+            if (!is_one(predicate) || !op->value.type().is_vector()) {
                 // TODO(psuriana): This store is predicated. Mark the buffer as
                 // not interleaved for now.
                 state = BufferState::NotInterleaved;
@@ -1500,8 +1538,14 @@ class EliminateInterleaves : public IRMutator2 {
                 // interleave itself, we don't want to change the
                 // buffer state.
             }
-        }
+            internal_assert(aligned_buffer_access.contains(op->name) && "Buffer not found in scope");
+            bool &aligned_accesses = aligned_buffer_access.ref(op->name);
+            int aligned_offset = 0;
 
+            if (!alignment_analyzer.is_aligned(op, &aligned_offset)) {
+                aligned_accesses = false;
+            }
+        }
         if (deinterleave_buffers.contains(op->name)) {
             // We're deinterleaving this buffer, remove the interleave
             // from the store.
@@ -1528,6 +1572,13 @@ class EliminateInterleaves : public IRMutator2 {
                 // which is only true if any of the stores are
                 // actually interleaved (and don't just yield an
                 // interleave).
+                internal_assert(aligned_buffer_access.contains(op->name) && "Buffer not found in scope");
+                bool &aligned_accesses = aligned_buffer_access.ref(op->name);
+                int aligned_offset = 0;
+
+                if (!alignment_analyzer.is_aligned(op, &aligned_offset)) {
+                    aligned_accesses = false;
+                }
             } else {
                 // This is not a double vector load, so we can't
                 // deinterleave the storage of this buffer.
@@ -1545,7 +1596,8 @@ class EliminateInterleaves : public IRMutator2 {
     using IRMutator2::visit;
 
 public:
-    EliminateInterleaves(int native_vector_bits) : native_vector_bits(native_vector_bits) {}
+    EliminateInterleaves(int native_vector_bytes, Scope<ModulusRemainder>& alignment_info) :
+        native_vector_bits(native_vector_bytes * 8), alignment_analyzer(native_vector_bytes, alignment_info) {}
 };
 
 // After eliminating interleaves, there may be some that remain. This
@@ -1949,6 +2001,113 @@ private:
     }
 };
 
+// Try generating vgathers instead of shuffles.
+// At present, we request VTCM memory with single page allocation flag for all
+// store_in allocations. So it's always safe to generate a vgather.
+// Expressions which generate vgathers are of the form:
+//     out(x) = lut(foo(x))
+// For vgathers out and lut should be in VTCM in a single page.
+class ScatterGatherGenerator : public IRMutator2 {
+    Scope<Interval> bounds;
+    std::unordered_map<string, const Allocate *> allocations;
+
+    using IRMutator2::visit;
+
+    template <typename NodeType, typename T>
+    NodeType visit_let(const T *op) {
+        // We only care about vector lets.
+        if (op->value.type().is_vector()) {
+            bounds.push(op->name, bounds_of_expr_in_scope(op->value, bounds));
+        }
+        NodeType node = IRMutator2::visit(op);
+        if (op->value.type().is_vector()) {
+            bounds.pop(op->name);
+        }
+        return node;
+    }
+
+    Expr visit(const Let *op) { return visit_let<Expr>(op); }
+
+    Stmt visit(const LetStmt *op) { return visit_let<Stmt>(op); }
+
+    Stmt visit(const Allocate *op) {
+        // Create a map of the allocation
+        allocations[op->name] = op;
+        return IRMutator2::visit(op);
+    }
+
+    // Try to match expressions of the form:
+    //     out(x) = lut(foo(x))
+    // to generate vgathers. Here, out and lut should have
+    // store_in(MemoryType::VTCM) directive. If a vgather is found return Call
+    // Expr to vgather, otherwise Expr().
+    Expr make_gather(const Load *op, Expr dst_base, Expr dst_index) {
+        Type ty = op->type;
+        const Allocate *alloc = allocations[op->name];
+        // The lut should be in VTCM.
+        if (!alloc || alloc->memory_type != MemoryType::VTCM) {
+            return Expr();
+        }
+        // HVX has only 16 or 32-bit gathers. Predicated vgathers are not
+        // supported yet.
+        if (op->index.as<Ramp>() || !is_one(op->predicate) || !ty.is_vector() ||
+            ty.bits() == 8) {
+            return Expr();
+        }
+        Expr index = mutate(ty.bytes() * op->index);
+        Interval index_bounds = bounds_of_expr_in_scope(index, bounds);
+        if (ty.bits() == 16 && index_bounds.is_bounded()) {
+            Expr index_span = span_of_bounds(index_bounds);
+            index_span = common_subexpression_elimination(index_span);
+            index_span = simplify(index_span);
+            // We need to downcast the index values to 16 bit signed. So all the
+            // the indices must be less than 1 << 15.
+            if (!can_prove(index_span < std::numeric_limits<int16_t>::max())) {
+                return Expr();
+            }
+        }
+        // Calculate the size of the buffer lut in bytes.
+        Expr size = ty.bytes();
+        for (size_t i = 0; i < alloc->extents.size(); i++) {
+            size *= alloc->extents[i];
+        }
+        Expr src = Variable::make(Handle(), op->name);
+        Expr new_index = mutate(cast(ty.with_code(Type::Int), index));
+        dst_index = mutate(dst_index);
+
+        return Call::make(ty, "gather", {dst_base, dst_index, src, size-1, new_index},
+                          Call::Intrinsic);
+    }
+
+    Stmt visit(const Store *op) {
+        // HVX has only 16 or 32-bit gathers. Predicated vgathers are not
+        // supported yet.
+        Type ty = op->value.type();
+        if (!is_one(op->predicate) || !ty.is_vector() || ty.bits() == 8) {
+            return IRMutator2::visit(op);
+        }
+        // To use vgathers, the destination address must be VTCM memory.
+        const Allocate *alloc = allocations[op->name];
+        if (!alloc || alloc->memory_type != MemoryType::VTCM) {
+            return IRMutator2::visit(op);
+        }
+        // The source for a gather must also be a buffer in VTCM.
+        if (op->index.as<Ramp>() && op->value.as<Load>()) {
+            // Check for vgathers
+            Expr dst_base = Variable::make(Handle(), op->name);
+            Expr dst_index = op->index.as<Ramp>()->base;
+            Expr value = make_gather(op->value.as<Load>(), dst_base, dst_index);
+            if (value.defined()) {
+                // Found a vgather.
+                // Function make_gather already mutates all the call arguements,
+                // so no need to mutate again.
+                return Evaluate::make(value);
+            }
+        }
+        return IRMutator2::visit(op);
+    }
+};
+
 }  // namespace
 
 Stmt optimize_hexagon_shuffles(Stmt s, int lut_alignment) {
@@ -1965,7 +2124,13 @@ Stmt vtmpy_generator(Stmt s) {
     return s;
 }
 
-Stmt optimize_hexagon_instructions(Stmt s, Target t) {
+Stmt scatter_gather_generator(Stmt s) {
+    // Generate vscatter-vgather instruction if target >= v65
+    s = ScatterGatherGenerator().mutate(s);
+    return s;
+}
+
+Stmt optimize_hexagon_instructions(Stmt s, Target t, Scope<ModulusRemainder> &alignment_info) {
     // Convert some expressions to an equivalent form which get better
     // optimized in later stages for hexagon
     s = RearrangeExpressions().mutate(s);
@@ -1975,7 +2140,7 @@ Stmt optimize_hexagon_instructions(Stmt s, Target t) {
     s = OptimizePatterns(t).mutate(s);
 
     // Try to eliminate any redundant interleave/deinterleave pairs.
-    s = EliminateInterleaves(t.natural_vector_size(Int(8))*8).mutate(s);
+    s = EliminateInterleaves(t.natural_vector_size(Int(8)), alignment_info).mutate(s);
 
     // There may be interleaves left over that we can fuse with other
     // operations.

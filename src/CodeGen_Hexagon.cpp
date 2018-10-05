@@ -56,6 +56,15 @@ CodeGen_Hexagon::CodeGen_Hexagon(Target t) : CodeGen_Posix(t) {
         << "llvm 5.0 or later is required for Hexagon v66.\n";
 #endif
     user_assert(llvm_Hexagon_enabled) << "llvm build not configured with Hexagon target enabled.\n";
+    if (target.has_feature(Halide::Target::HVX_v66)) {
+        isa_version = 66;
+    } else if (target.has_feature(Halide::Target::HVX_v65)) {
+        isa_version = 65;
+    } else if (target.has_feature(Halide::Target::HVX_v62)) {
+        isa_version = 62;
+    } else {
+        isa_version = 60;
+    }
 }
 
 std::unique_ptr<llvm::Module> CodeGen_Hexagon::compile(const Module &module) {
@@ -300,6 +309,12 @@ void CodeGen_Hexagon::compile_func(const LoweredFunc &f,
     body = unpredicate_loads_stores(body);
     debug(2) << "Lowering after unpredicating loads/stores:\n" << body << "\n\n";
 
+    if (target.has_feature(Target::HVX_v65)) {
+        // Generate vscatter-vgathers before optimize_hexagon_shuffles.
+        debug(1) << "Looking for vscatter-vgather...\n";
+        body = scatter_gather_generator(body);
+    }
+
     debug(1) << "Optimizing shuffles...\n";
     // vlut always indexes 64 bytes of the LUT at a time, even in 128 byte mode.
     const int lut_alignment = 64;
@@ -335,7 +350,7 @@ void CodeGen_Hexagon::compile_func(const LoweredFunc &f,
 
     // Optimize the IR for Hexagon.
     debug(1) << "Optimizing Hexagon instructions...\n";
-    body = optimize_hexagon_instructions(body, target);
+    body = optimize_hexagon_instructions(body, target, alignment_info);
 
     debug(1) << "Adding calls to qurt_hvx_lock, if necessary...\n";
     body = inject_hvx_lock_unlock(body, target);
@@ -347,6 +362,18 @@ void CodeGen_Hexagon::compile_func(const LoweredFunc &f,
 
     CodeGen_Posix::end_func(f.args);
 }
+
+struct HvxIntrinsic {
+    enum {
+        BroadcastScalarsToWords = 1 << 0,  // Some intrinsics need scalar arguments broadcasted up to 32 bits.
+        v65OrLater = 1 << 1,
+    };
+    Intrinsic::ID id;
+    Type ret_type;
+    const char *name;
+    vector<Type> arg_types;
+    int flags;
+};
 
 void CodeGen_Hexagon::init_module() {
     CodeGen_Posix::init_module();
@@ -379,16 +406,6 @@ void CodeGen_Hexagon::init_module() {
     // operands, they all operate on vectors of 32 bit integers. To make
     // it easier to generate code, we define wrapper intrinsics with
     // the correct type (plus the necessary bitcasts).
-    struct HvxIntrinsic {
-        enum {
-            BroadcastScalarsToWords = 1 << 0,  // Some intrinsics need scalar arguments broadcasted up to 32 bits.
-        };
-        Intrinsic::ID id;
-        Type ret_type;
-        const char *name;
-        vector<Type> arg_types;
-        int flags;
-    };
     vector<HvxIntrinsic> intrinsic_wrappers = {
         // Zero/sign extension:
         { IPICK(is_128B, Intrinsic::hexagon_V6_vzb), u16v2,  "zxt.vub", {u8v1} },
@@ -493,6 +510,9 @@ void CodeGen_Hexagon::init_module() {
         // Absolute value:
         { IPICK(is_128B, Intrinsic::hexagon_V6_vabsh),   u16v1, "abs.vh", {i16v1} },
         { IPICK(is_128B, Intrinsic::hexagon_V6_vabsw),   u32v1, "abs.vw", {i32v1} },
+#if LLVM_VERSION >= 60
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vabsb),   u8v1, "abs.vb", {i8v1}, HvxIntrinsic::v65OrLater },
+#endif
 
         // Absolute difference:
         { IPICK(is_128B, Intrinsic::hexagon_V6_vabsdiffub),  u8v1,  "absd.vub.vub", {u8v1,  u8v1} },
@@ -514,7 +534,10 @@ void CodeGen_Hexagon::init_module() {
         { IPICK(is_128B, Intrinsic::hexagon_V6_vnavgub), i8v1,  "navg.vub.vub", {u8v1,  u8v1} },
         { IPICK(is_128B, Intrinsic::hexagon_V6_vnavgh),  i16v1, "navg.vh.vh",   {i16v1, i16v1} },
         { IPICK(is_128B, Intrinsic::hexagon_V6_vnavgw),  i32v1, "navg.vw.vw",   {i32v1, i32v1} },
-
+#if LLVM_VERSION >= 60
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavgb),  i8v1,  "avg.vb.vb",   {i8v1, i8v1}, HvxIntrinsic::v65OrLater },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vavguw), u32v1, "avg.vuw.vuw", {u32v1, u32v1}, HvxIntrinsic::v65OrLater },
+#endif
         // Non-widening multiplication:
         { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyih),  i16v1, "mul.vh.vh",   {i16v1, i16v1} },
         { IPICK(is_128B, Intrinsic::hexagon_V6_vmpyihb), i16v1, "mul.vh.b",    {i16v1, i8}, HvxIntrinsic::BroadcastScalarsToWords },
@@ -638,7 +661,10 @@ void CodeGen_Hexagon::init_module() {
         { IPICK(is_128B, Intrinsic::hexagon_V6_vaslw),  u32v1, "shl.vuw.uw", {u32v1, u32} },
         { IPICK(is_128B, Intrinsic::hexagon_V6_vaslh),  i16v1, "shl.vh.h",   {i16v1, i16} },
         { IPICK(is_128B, Intrinsic::hexagon_V6_vaslw),  i32v1, "shl.vw.w",   {i32v1, i32} },
-
+#if LLVM_VERSION >= 60
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vasrh_acc), i16v1, "add_shr.vh.vh.h", {i16v1, i16v1, i16}, HvxIntrinsic::BroadcastScalarsToWords | HvxIntrinsic::v65OrLater },
+        { IPICK(is_128B, Intrinsic::hexagon_V6_vaslh_acc), i16v1, "add_shl.vh.vh.h", {i16v1, i16v1, i16}, HvxIntrinsic::BroadcastScalarsToWords | HvxIntrinsic::v65OrLater },
+#endif
         { IPICK(is_128B, Intrinsic::hexagon_V6_vasrw_acc), i32v1, "add_shr.vw.vw.w", {i32v1, i32v1, i32} },
         { IPICK(is_128B, Intrinsic::hexagon_V6_vaslw_acc), i32v1, "add_shl.vw.vw.w", {i32v1, i32v1, i32} },
 
@@ -682,23 +708,28 @@ void CodeGen_Hexagon::init_module() {
     // need to be implemented in the runtime module, or via
     // fall-through to CodeGen_LLVM.
     for (HvxIntrinsic &i : intrinsic_wrappers) {
-        define_hvx_intrinsic(i.id, i.ret_type, i.name, i.arg_types,
-                             i.flags & HvxIntrinsic::BroadcastScalarsToWords);
+        define_hvx_intrinsic(i.id, i.ret_type, i.name, i.arg_types, i.flags);
     }
 }
 
 llvm::Function *CodeGen_Hexagon::define_hvx_intrinsic(int id, Type ret_ty, const string &name,
-                                                      const vector<Type> &arg_types, bool broadcast_scalar_word) {
+                                                      const vector<Type> &arg_types, int flags) {
     internal_assert(id != Intrinsic::not_intrinsic);
     // Get the real intrinsic.
     llvm::Function *intrin = Intrinsic::getDeclaration(module.get(), (llvm::Intrinsic::ID)id);
-    return define_hvx_intrinsic(intrin, ret_ty, name, arg_types, broadcast_scalar_word);
+    return define_hvx_intrinsic(intrin, ret_ty, name, arg_types, flags);
 }
 
 llvm::Function *CodeGen_Hexagon::define_hvx_intrinsic(llvm::Function *intrin, Type ret_ty, const string &name,
-                                                      vector<Type> arg_types, bool broadcast_scalar_word) {
+                                                      vector<Type> arg_types, int flags) {
     internal_assert(intrin) << "Null definition for intrinsic '" << name << "'\n";
     llvm::FunctionType *intrin_ty = intrin->getFunctionType();
+    bool broadcast_scalar_word = flags & HvxIntrinsic::BroadcastScalarsToWords;
+    bool v65OrLater = flags & HvxIntrinsic::v65OrLater;
+
+    if (v65OrLater && !is_hvx_v65_or_later()) {
+        return nullptr;
+    }
 
     // Get the types of the arguments we want to pass.
     vector<llvm::Type *> llvm_arg_types;
@@ -1749,7 +1780,6 @@ void CodeGen_Hexagon::visit(const Call *op) {
     // Map Halide functions to Hexagon intrinsics, plus a boolean
     // indicating if the intrinsic has signed variants or not.
     static std::map<string, std::pair<string, bool>> functions = {
-        { Call::abs, { "halide.hexagon.abs", true } },
         { Call::absd, { "halide.hexagon.absd", true } },
         { Call::bitwise_and, { "halide.hexagon.and", false } },
         { Call::bitwise_or, { "halide.hexagon.or", false } },
@@ -1810,6 +1840,15 @@ void CodeGen_Hexagon::visit(const Call *op) {
                                 type_suffix(op->args[1], op->args[2], false),
                                 op->args);
             return;
+        } else if (op->is_intrinsic(Call::abs)) {
+            internal_assert(op->args.size() == 1);
+            Type ty = op->args[0].type();
+            if ((ty.is_vector() && ty.is_int())) {
+                if (ty.bits() != 8 || is_hvx_v65_or_later()) {
+                    value = call_intrin(op->type, "halide.hexagon.abs" + type_suffix(op->args[0]), op->args);
+                    return;
+                }
+            }
         } else if (op->is_intrinsic(Call::cast_mask)) {
             internal_error << "cast_mask should already have been handled in HexagonOptimize\n";
         }
@@ -1867,6 +1906,35 @@ void CodeGen_Hexagon::visit(const Call *op) {
         return;
     }
 
+    if (op->is_intrinsic() && op->name == "gather") {
+        internal_assert(op->args.size() == 5);
+        internal_assert(op->type.bits() != 8);
+        int index_lanes = op->type.lanes();
+        int intrin_lanes = native_vector_bits()/op->type.bits();
+
+        string name = "halide.hexagon.vgather";
+        name += (op->type.bits() == 16) ? ".h.h" : ".w.w";
+        llvm::Function *fn = module->getFunction(name);
+
+        Value *dst_buffer = codegen(op->args[0]);
+        Value *src_ptr = codegen(op->args[2]);
+        Value *size = codegen(op->args[3]);
+        Value *index = codegen(op->args[4]);
+
+        // Cut up the indices into appropriately-sized pieces.
+        for (int start = 0; start < index_lanes; start += intrin_lanes) {
+            vector<Value *> args;
+            Value *new_index = slice_vector(index, start, intrin_lanes);
+            args.push_back(dst_buffer);
+            args.push_back(codegen(op->args[1] + start));
+            args.push_back(src_ptr);
+            args.push_back(size);
+            args.push_back(new_index);
+            value = builder->CreateCall(fn, args);
+        }
+        return;
+    }
+
     CodeGen_Posix::visit(op);
 }
 
@@ -1877,8 +1945,7 @@ void CodeGen_Hexagon::visit(const Broadcast *op) {
     } else {
         // TODO: Use vd0?
         string v62orLater_suffix = "";
-        if (target.features_any_of({Target::HVX_v62, Target::HVX_v65, Target::HVX_v66}) &&
-            (op->value.type().bits() == 8 || op->value.type().bits() == 16))
+        if (is_hvx_v62_or_later() && (op->value.type().bits() == 8 || op->value.type().bits() == 16))
             v62orLater_suffix = "_v62";
 
         value = call_intrin(op->type,
@@ -1988,6 +2055,29 @@ void CodeGen_Hexagon::visit(const NE *op) {
         Expr eq = Not::make(EQ::make(op->a, op->b));
         eq = eliminate_bool_vectors(eq);
         eq.accept(this);
+    } else {
+        CodeGen_Posix::visit(op);
+    }
+}
+
+void CodeGen_Hexagon::visit(const Allocate *op) {
+    if (op->memory_type == MemoryType::VTCM && !op->new_expr.defined()) {
+        if (!target.has_feature(Target::HVX_v65)) {
+            user_error << "VTCM store_in requires hvx_v65 target feature.\n";
+        }
+        // Calculate size of allocation.
+        Expr size = op->type.bytes();
+        for (size_t i = 0; i < op->extents.size(); i++) {
+            size *= op->extents[i];
+        }
+        size += allocation_padding(op->type);
+        Expr new_expr = Call::make(Handle(), "halide_vtcm_malloc", {size},
+                                   Call::Extern);
+        string free_function = "halide_vtcm_free";
+        Stmt new_alloc = Allocate::make(op->name, op->type, op->memory_type,
+                                        op->extents, op->condition, op->body,
+                                        new_expr, free_function);
+        new_alloc.accept(this);
     } else {
         CodeGen_Posix::visit(op);
     }
